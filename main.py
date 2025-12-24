@@ -1,12 +1,25 @@
 import os
 from datetime import date
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import requests
-from openai import OpenAI
+from flask import Flask, request, jsonify # type: ignore
+from flask_cors import CORS # type: ignore
+import requests # type: ignore
+from openai import OpenAI # type: ignore
 
 app = Flask(__name__)
-CORS(app)
+
+# 🔒 LOCKED CORS — only your sites can call the backend
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": [
+                "https://asklit.online",
+                "https://www.asklit.online",
+                "http://localhost:3000"
+            ]
+        }
+    }
+)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
