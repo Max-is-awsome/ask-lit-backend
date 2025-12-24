@@ -1,11 +1,15 @@
 import os
 from datetime import date
-from flask import Flask, request, jsonify # type: ignore
-from flask_cors import CORS # type: ignore
-import requests # type: ignore
-from openai import OpenAI # type: ignore
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+from openai import OpenAI
+from upstash_redis import Redis
 
 app = Flask(__name__)
+
+# ✅ REQUIRED FOR RENDER / PROXIES
+app.config["TRUST_PROXY_HEADERS"] = True
 
 # 🔒 LOCKED CORS — only your sites can call the backend
 CORS(
@@ -21,27 +25,50 @@ CORS(
     }
 )
 
+# 🔑 API KEYS
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
 
 if not OPENAI_API_KEY or not GOOGLE_BOOKS_API_KEY:
     raise RuntimeError("Missing API keys in environment variables")
 
+# 🔑 REDIS (PERSISTENT STORAGE)
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
+if not REDIS_URL or not REDIS_TOKEN:
+    raise RuntimeError("Missing Upstash Redis credentials")
+
+redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 DAILY_LIMIT = 10
-usage = {}  # { ip: { "date": YYYY-MM-DD, "count": int } }
 
 
+# ✅ GET REAL CLIENT IP
+def get_client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+# ✅ PERSISTENT DAILY RATE LIMIT (24h rolling window)
 def check_rate_limit(ip):
     today = str(date.today())
-    if ip not in usage or usage[ip]["date"] != today:
-        usage[ip] = {"date": today, "count": 0}
+    key = f"rate_limit:{ip}:{today}"
 
-    if usage[ip]["count"] >= DAILY_LIMIT:
+    count = redis.get(key)
+
+    if count is None:
+        redis.set(key, 1, ex=86400)  # 24 hours
+        return True
+
+    if int(count) >= DAILY_LIMIT:
         return False
 
-    usage[ip]["count"] += 1
+    redis.incr(key)
     return True
 
 
@@ -64,26 +91,26 @@ def search_google_books_for_quote(query):
             search_info = volume.get("searchInfo", {})
             access_info = volume.get("accessInfo", {})
 
-            if access_info.get("viewability") not in ["PARTIAL", "ALL_PAGES", "FULL", "SAMPLE"]:
+            if access_info.get("viewability") not in {
+                "PARTIAL", "ALL_PAGES", "FULL", "SAMPLE"
+            }:
                 continue
 
-            title = volume_info.get("title", "Unknown Title")
             quote = (search_info.get("textSnippet") or "").replace("...", "").strip()
-            link = volume_info.get("previewLink", "https://books.google.com/")
-            published_date = volume_info.get("publishedDate", "9999")
+            if not quote:
+                continue
 
-            if quote:
-                books.append({
-                    "title": title,
-                    "quote": quote,
-                    "link": link,
-                    "published_date": published_date
-                })
+            books.append({
+                "title": volume_info.get("title", "Unknown Title"),
+                "quote": quote,
+                "link": volume_info.get("previewLink", "https://books.google.com/"),
+                "published_date": volume_info.get("publishedDate", "Unknown")
+            })
 
     if not books:
         return [{
-            "quote": "No previewable books with snippets found.",
             "title": None,
+            "quote": "No previewable books with snippets found.",
             "link": None,
             "published_date": None
         }]
@@ -94,7 +121,7 @@ def search_google_books_for_quote(query):
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ip = get_client_ip()
 
     if not check_rate_limit(ip):
         return jsonify({
