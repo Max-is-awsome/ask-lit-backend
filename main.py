@@ -14,18 +14,14 @@ GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
 if not OPENAI_API_KEY or not GOOGLE_BOOKS_API_KEY:
     raise RuntimeError("Missing API keys in environment variables")
 
-client = OpenAI()
-
-# =====================
-# Rate limiting (10/day/IP)
-# =====================
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 DAILY_LIMIT = 10
 usage = {}  # { ip: { "date": YYYY-MM-DD, "count": int } }
 
+
 def check_rate_limit(ip):
     today = str(date.today())
-
     if ip not in usage or usage[ip]["date"] != today:
         usage[ip] = {"date": today, "count": 0}
 
@@ -35,10 +31,6 @@ def check_rate_limit(ip):
     usage[ip]["count"] += 1
     return True
 
-
-# =====================
-# Google Books helpers
-# =====================
 
 def search_google_books_for_quote(query):
     url = "https://www.googleapis.com/books/v1/volumes"
@@ -51,7 +43,6 @@ def search_google_books_for_quote(query):
 
     response = requests.get(url, params=params)
     data = response.json()
-
     books = []
 
     if response.status_code == 200 and "items" in data:
@@ -65,8 +56,8 @@ def search_google_books_for_quote(query):
 
             title = volume_info.get("title", "Unknown Title")
             quote = (search_info.get("textSnippet") or "").replace("...", "").strip()
-            published_date = volume_info.get("publishedDate", "9999")
             link = volume_info.get("previewLink", "https://books.google.com/")
+            published_date = volume_info.get("publishedDate", "9999")
 
             if quote:
                 books.append({
@@ -88,10 +79,6 @@ def search_google_books_for_quote(query):
     return books
 
 
-# =====================
-# Routes
-# =====================
-
 @app.route("/chat", methods=["POST"])
 def chat():
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
@@ -101,40 +88,37 @@ def chat():
             "error": "Daily request limit reached (10 per day). Try again tomorrow."
         }), 429
 
-    try:
-        data = request.get_json(silent=True) or {}
-        message = (data.get("message") or "").strip()
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
 
-        if not message:
-            return jsonify({"error": "Empty message"}), 400
+    if not message:
+        return jsonify({"error": "Empty message"}), 400
 
-        prompt = (
-            "Extract a short keyword-based search query for books.\n"
-            "Rules:\n"
-            "- 3 to 5 words max\n"
-            "- lowercase\n"
-            "- no punctuation\n"
-            "- return ONLY the keywords\n\n"
-            f'User message: "{message}"'
-        )
+    prompt = (
+        "Extract a short keyword-based search query for books.\n"
+        "Rules:\n"
+        "- 3 to 5 words max\n"
+        "- lowercase\n"
+        "- no punctuation\n"
+        "- return ONLY the keywords\n\n"
+        f'User message: "{message}"'
+    )
 
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=prompt
-        )
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=prompt
+    )
 
-        query = response.output_text.strip()
-        books = search_google_books_for_quote(query)
+    query = response.output_text.strip()
+    books = search_google_books_for_quote(query)
 
-        return jsonify({
-            "reply": f"Here are some books I found for: '{query}'",
-            "query": query,
-            "books": books
-        })
-
-    except Exception as e:
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+    return jsonify({
+        "reply": f"Here are some books I found for: '{query}'",
+        "query": query,
+        "books": books
+    })
 
 
 if __name__ == "__main__":
-    app.run(port=5001, debug=True)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port)
