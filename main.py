@@ -71,6 +71,11 @@ def check_rate_limit(ip):
     redis.incr(key)
     return True
 
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+
 
 def search_google_books_for_quote(query):
     url = "https://www.googleapis.com/books/v1/volumes"
