@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import date
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -6,12 +7,12 @@ import requests
 from openai import OpenAI
 from upstash_redis import Redis
 
-app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ✅ REQUIRED FOR RENDER / PROXIES
+app = Flask(__name__)
 app.config["TRUST_PROXY_HEADERS"] = True
 
-# 🔒 LOCKED CORS — only your sites can call the backend
 CORS(
     app,
     resources={
@@ -25,28 +26,24 @@ CORS(
     }
 )
 
-# 🔑 API KEYS
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
-
-if not OPENAI_API_KEY or not GOOGLE_BOOKS_API_KEY:
-    raise RuntimeError("Missing API keys in environment variables")
-
-# 🔑 REDIS (PERSISTENT STORAGE)
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY not set — /chat will return 503")
+if not GOOGLE_BOOKS_API_KEY:
+    logger.warning("GOOGLE_BOOKS_API_KEY not set — /chat will return 503")
 if not REDIS_URL or not REDIS_TOKEN:
-    raise RuntimeError("Missing Upstash Redis credentials")
+    logger.warning("Upstash Redis credentials not set — rate limiting disabled")
 
-redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+redis = Redis(url=REDIS_URL, token=REDIS_TOKEN) if (REDIS_URL and REDIS_TOKEN) else None
 
 DAILY_LIMIT = 10
 
 
-# ✅ GET REAL CLIENT IP
 def get_client_ip():
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
@@ -54,27 +51,32 @@ def get_client_ip():
     return request.remote_addr or "unknown"
 
 
-# ✅ PERSISTENT DAILY RATE LIMIT (24h rolling window)
 def check_rate_limit(ip):
-    today = str(date.today())
-    key = f"rate_limit:{ip}:{today}"
-
-    count = redis.get(key)
-
-    if count is None:
-        redis.set(key, 1, ex=86400)  # 24 hours
+    if redis is None:
         return True
 
-    if int(count) >= DAILY_LIMIT:
-        return False
+    try:
+        today = str(date.today())
+        key = f"rate_limit:{ip}:{today}"
+        count = redis.get(key)
 
-    redis.incr(key)
-    return True
+        if count is None:
+            redis.set(key, 1, ex=86400)
+            return True
+
+        if int(count) >= DAILY_LIMIT:
+            return False
+
+        redis.incr(key)
+        return True
+    except Exception as e:
+        logger.error("Redis error during rate limit check: %s", e)
+        return True  # fail open — don't block users if Redis is down
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
-
 
 
 def search_google_books_for_quote(query):
@@ -126,6 +128,9 @@ def search_google_books_for_quote(query):
 
 @app.route("/chat", methods=["POST"])
 def chat():
+    if not client or not GOOGLE_BOOKS_API_KEY:
+        return jsonify({"error": "Service is not configured. Check server logs."}), 503
+
     ip = get_client_ip()
 
     if not check_rate_limit(ip):
@@ -149,12 +154,16 @@ def chat():
         f'User message: "{message}"'
     )
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=prompt
-    )
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=prompt
+        )
+        query = response.output_text.strip()
+    except Exception as e:
+        logger.error("OpenAI error: %s", e)
+        return jsonify({"error": "Failed to process your question. Please try again."}), 502
 
-    query = response.output_text.strip()
     books = search_google_books_for_quote(query)
 
     return jsonify({
